@@ -6,6 +6,7 @@ from pathlib import Path
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider
+from deerflow.skills.storage import user_should_see_legacy_skills
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,7 @@ class LocalSandboxProvider(SandboxProvider):
             _RESERVED_CONTAINER_PREFIXES = [
                 f"{container_path}/public",
                 f"{container_path}/custom",
+                f"{container_path}/integrations",
                 f"{container_path}/legacy",
                 _ACP_WORKSPACE_VIRTUAL_PREFIX,
                 _USER_DATA_VIRTUAL_PREFIX,
@@ -286,12 +288,21 @@ class LocalSandboxProvider(SandboxProvider):
             config = get_app_config()
             skills_container_path = config.skills.container_path
             user_custom_path = paths.user_custom_skills_dir(effective_user_id)
+            integrations_path = paths.integration_skills_dir()
             user_custom_path.mkdir(parents=True, exist_ok=True)
+            integrations_path.mkdir(parents=True, exist_ok=True)
 
             mappings.append(
                 PathMapping(
                     container_path=f"{skills_container_path}/custom",
                     local_path=str(user_custom_path),
+                    read_only=True,
+                )
+            )
+            mappings.append(
+                PathMapping(
+                    container_path=f"{skills_container_path}/integrations",
+                    local_path=str(integrations_path),
                     read_only=True,
                 )
             )
@@ -310,8 +321,7 @@ class LocalSandboxProvider(SandboxProvider):
             skills_container_path = config.skills.container_path
             user_custom_path = paths.user_custom_skills_dir(effective_user_id)
             legacy_skills_path = config.skills.get_skills_path() / "custom"
-            user_has_no_custom_skills = not any(p.is_dir() and not p.name.startswith(".") for p in user_custom_path.iterdir()) if user_custom_path.exists() else True
-            if user_has_no_custom_skills and legacy_skills_path.exists() and any((legacy_skills_path / d / "SKILL.md").exists() for d in legacy_skills_path.iterdir() if d.is_dir() and not d.name.startswith(".")):
+            if user_should_see_legacy_skills(effective_user_id, host_path=str(config.skills.get_skills_path())) and legacy_skills_path.exists():
                 mappings.append(
                     PathMapping(
                         container_path=f"{skills_container_path}/legacy",
