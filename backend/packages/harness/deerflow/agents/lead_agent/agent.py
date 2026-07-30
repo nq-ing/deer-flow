@@ -480,6 +480,167 @@ def build_middlewares(
 
 def _available_skill_names(agent_config, is_bootstrap: bool) -> set[str] | None:
     if is_bootstrap:
+        return set(_BOOTSTRAP_SKILL_NAMES)
+    if agent_config and agent_config.skills is not None:
+        return set(agent_config.skills)
+    return None
+
+
+def _load_enabled_available_skills(available_skills: set[str] | None, *, app_config: AppConfig, user_id: str | None = None) -> list[Skill]:
+    try:
+        from deerflow.agents.lead_agent.prompt import get_enabled_skills_for_config
+
+        skills = get_enabled_skills_for_config(app_config, user_id=user_id)
+    except Exception:
+        logger.exception("Failed to load enabled skills")
+        raise
+
+    if available_skills is None:
+        return skills
+    return [skill for skill in skills if skill.name in available_skills]
+
+
+def make_lead_agent(config: RunnableConfig):
+    """LangGraph graph factory; keep the signature compatible with LangGraph Server."""
+    runtime_config = _get_runtime_config(config)
+    runtime_app_config = runtime_config.get("app_config")
+    if not isinstance(runtime_app_config, AppConfig):
+        runtime_app_config = get_app_config()
+    # Mode selection precedence, pinned by test_checkpoint_mode.py:
+    # - First freeze: the app config owns the process mode; a client-supplied
+    #   configurable key is ignored so a direct LangGraph request cannot
+    #   reconfigure (or crash) a fresh process.
+    # - Once frozen: an internally injected key (run worker / gateway) or the
+    #   app config must match the frozen mode; ``freeze_checkpoint_channel_mode``
+    #   fails closed on any mismatch, so neither a forged key nor a config.yaml
+    #   change can silently reconfigure the process.
+    frozen_mode = frozen_checkpoint_channel_mode()
+    if frozen_mode is None:
+        requested_mode = runtime_app_config.database.checkpoint_channel_mode
+    else:
+        requested_mode = (config.get("configurable", {}) or {}).get(
+            INTERNAL_CHECKPOINT_MODE_KEY,
+            runtime_app_config.database.checkpoint_channel_mode,
+        )
+    mode = freeze_checkpoint_channel_mode(requested_mode)
+    # The snapshot cadence travels with the mode: restart-required, frozen
+    # from the app config, and deliberately not client-injectable (a forged
+    # configurable key must not recompile the channel table either).
+    freeze_checkpoint_snapshot_frequency(runtime_app_config.database.checkpoint_delta.snapshot_frequency)
+    inject_checkpoint_mode(config, mode)
+    return _make_lead_agent(config, app_config=runtime_app_config)
+
+
+def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
+    # Lazy import to avoid circular dependency
+    from deerflow.tools import get_available_tools
+    from deerflow.tools.builtins import setup_agent, update_agent
+    from deerflow.tools.builtins.tool_search import assemble_deferred_tools, build_mcp_routing_middleware, get_mcp_routing_hints_prompt_section
+
+    cfg = _get_runtime_config(config)
+    resolved_app_config = app_config
+    mode = (config.get("configurable", {}) or {}).get(
+        INTERNAL_CHECKPOINT_MODE_KEY,
+        resolved_app_config.database.checkpoint_channel_mode,
+    )
+
+    # Resolve one authoritative identity for every user-scoped factory input.
+    # Agent Server's reserved auth fields win over ordinary client-supplied
+    # context/configurable values; the embedded Gateway path uses context.user_id.
+    from deerflow.runtime.user_context import resolve_config_user_id
+
+    resolved_user_id = resolve_config_user_id(config)
+
+    requested_model_name: str | None = cfg.get("model_name") or cfg.get("model")
+    is_plan_mode = cfg.get("is_plan_mode", False)
+    subagent_enabled = cfg.get("subagent_enabled", False)
+    max_concurrent_subagents = cfg.get("max_concurrent_subagents", 3)
+    max_total_subagents = cfg.get("max_total_subagents", _default_max_total_subagents(resolved_app_config))
+    is_bootstrap = cfg.get("is_bootstrap", False)
+    non_interactive = bool(cfg.get("non_interactive", False))
+    agent_name = validate_agent_name(cfg.get("agent_name"))
+
+    agent_config = load_agent_config(agent_name, user_id=resolved_user_id) if not is_bootstrap else None
+    available_skills = _available_skill_names(agent_config, is_bootstrap)
+    # Custom agent model from agent config (if any), or None to let _resolve_model_name pick the default
+    agent_model_name = agent_config.model if agent_config and agent_config.model else None
+
+    # thinking / reasoning precedence: request > custom agent default > runtime
+    # default (issue #4336). See ``_resolve_runtime_option`` for the falsy-vs-unset
+    # handling.
+    agent_thinking = getattr(agent_config, "thinking_enabled", None) if agent_config else None
+    agent_reasoning = getattr(agent_config, "reasoning_effort", None) if agent_config else None
+    thinking_enabled = bool(_resolve_runtime_option(cfg, "thinking_enabled", agent_thinking, True))
+    reasoning_effort = _resolve_runtime_option(cfg, "reasoning_effort", agent_reasoning, None)
+
+    # Per-agent sampling overrides (temperature / max_tokens) layered on top of
+    # the resolved model profile (issue #4336). None when the agent set none.
+    agent_model_settings = getattr(agent_config, "model_settings", None) if agent_config else None
+    agent_model_overrides = agent_model_settings.model_dump(exclude_none=True) if agent_model_settings else None
+
+    # Final model name resolution: request → agent config → global default, with fallback for unknown names
+    model_name = _resolve_model_name(requested_model_name or agent_model_name, app_config=resolved_app_config)
+
+    model_config = resolved_app_config.get_model_config(model_name)
+
+    if model_config is None:
+        raise ValueError("No chat model could be resolved. Please configure at least one model in config.yaml or provide a valid 'model_name'/'model' in the request.")
+    if thinking_enabled and not model_config.supports_thinking:
+        logger.warning(f"Thinking mode is enabled but model '{model_name}' does not support it; fallback to non-thinking mode.")
+        thinking_enabled = False
+
+    logger.info(
+        "Create Agent(%s) -> thinking_enabled: %s, reasoning_effort: %s, model_name: %s, is_plan_mode: %s, subagent_enabled: %s, max_concurrent_subagents: %s, max_total_subagents: %s",
+        agent_name or "default",
+        thinking_enabled,
+        reasoning_effort,
+        model_name,
+        is_plan_mode,
+        subagent_enabled,
+        max_concurrent_subagents,
+        max_total_subagents,
+    )
+
+    # Inject run metadata for LangSmith trace tagging
+    if "metadata" not in config:
+        config["metadata"] = {}
+
+    config["metadata"].update(
+        {
+            "agent_name": agent_name or "default",
+            "model_name": model_name or "default",
+            "thinking_enabled": thinking_enabled,
+            "reasoning_effort": reasoning_effort,
+            "is_plan_mode": is_plan_mode,
+            "subagent_enabled": subagent_enabled,
+            "tool_groups": agent_config.tool_groups if agent_config else None,
+            "available_skills": sorted(available_skills) if available_skills is not None else None,
+        }
+    )
+
+    # Inject tracing callbacks at the graph invocation root so a single LangGraph
+    # run produces one trace with all node / LLM / tool calls as child spans,
+    # AND so the Langfuse handler sees ``on_chain_start(parent_run_id=None)`` and
+    # actually propagates ``langfuse_session_id`` / ``langfuse_user_id`` from
+    # ``config["metadata"]`` onto the trace. Without root-level attachment the
+    # model is a nested observation and the handler strips ``langfuse_*`` keys.
+    tracing_callbacks = build_tracing_callbacks()
+    if tracing_callbacks:
+        existing = config.get("callbacks") or []
+        if not isinstance(existing, list):
+            existing = list(existing)
+        config["callbacks"] = [*existing, *tracing_callbacks]
+
+    enabled_skills = _load_enabled_available_skills(available_skills, app_config=resolved_app_config, user_id=resolved_user_id)
+
+    # Build skill search setup (deferred skill discovery).
+    # Controlled by skills.deferred_discovery — independent from tool_search.enabled.
+    from deerflow.skills.describe import build_skill_search_setup
+
+    skill_search_enabled = resolved_app_config.skills.deferred_discovery
+    container_base_path = resolved_app_config.skills.container_path
+
+    if is_bootstrap:
         # Special bootstrap agent with minimal prompt for initial custom agent creation flow.
         # Keep the bootstrap tool set intentionally narrow so agent creation
         # remains deterministic before the custom agent's own config exists.
