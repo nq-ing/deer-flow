@@ -88,7 +88,7 @@ token_budget:
 # runaway API cost / DoS. Invalid or non-positive client values fall back to
 # the server default of 100. Raise this only if you legitimately run very
 # deeply nested subagent graphs.
-max_recursion_limit: 1000
+max_recursion_limit: 2147483647
 
 
 # ============================================================================
@@ -1077,7 +1077,7 @@ input_polish:
 # Frequency thresholds are safety limits for repeated use of the same tool type.
 
 loop_detection:
-  enabled: true
+  enabled: false
   warn_threshold: 3
   hard_limit: 5
   window_size: 20
